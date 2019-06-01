@@ -15,7 +15,7 @@ def test_encoders():
         encoder.ResNetEncoder(),
         encoder.OnmtEncoder(num_layers=2, bidirectional=True,
                             rnn_size=512, dropout=0.5),
-        # encoder.FullyConvEncoder()
+        encoder.DarknetEncoder()
     ]
 
     for enc in encoders:

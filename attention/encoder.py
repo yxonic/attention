@@ -28,6 +28,7 @@ class ImageEncoder(nn.Module):
 
 @fret.configurable
 class VGGEncoder(ImageEncoder):
+    """Encoder that resembles VGG architecture."""
     def __init__(self, out_dim=128):
         super().__init__(out_dim, 8)
         cfg = [8, 16, 'M', 32, 32, 'M', 64, out_dim, 'M']
@@ -36,6 +37,7 @@ class VGGEncoder(ImageEncoder):
 
 @fret.configurable
 class ResNetEncoder(ImageEncoder):
+    """Encoder that resembles ResNet architecture."""
     def __init__(self):
         super().__init__(128, 8)
         res = resnet18()
@@ -144,9 +146,74 @@ class OnmtEncoder(ImageEncoder):
 
 
 @fret.configurable
-class FullyConvEncoder(ImageEncoder):
-    def __init__(self, out_dim=128):
-        super().__init__(out_dim, 1)
+class DarknetEncoder(ImageEncoder):
+    """Darknet from YOLOv3."""
+    def __init__(self):
+        super().__init__(256, 8)
+        import os
+        import sh
+        if not os.path.exists('data/yolov3.cfg'):
+            os.makedirs('data', exist_ok=True)
+            sh.wget('-O', 'data/yolov3.cfg',
+                    'https://raw.githubusercontent.com/'
+                    'pjreddie/darknet/master/cfg/yolov3.cfg')
+        self.blocks = parse_cfg('data/yolov3.cfg')
+        self.net_info, self.module_list = create_modules(self.blocks)
+
+    def forward(self, x):
+        size = list(x.size())
+        size[1] = 3
+        x = x.expand(*size)
+
+        modules = self.blocks[1:38]
+        outputs = {}
+        # write = 0
+        for i, module in enumerate(modules):
+            module_type = (module['type'])
+
+            if module_type == 'convolutional' or module_type == 'upsample':
+                x = self.module_list[i](x)
+
+            elif module_type == 'route':
+                layers = module['layers']
+                layers = [int(a) for a in layers.split(',')]
+
+                if layers[0] > 0:
+                    layers[0] = layers[0] - i
+
+                if len(layers) == 1:
+                    x = outputs[i + (layers[0])]
+
+                else:
+                    if layers[1] > 0:
+                        layers[1] = layers[1] - i
+
+                    map1 = outputs[i + layers[0]]
+                    map2 = outputs[i + layers[1]]
+                    x = torch.cat((map1, map2), 1)
+
+            elif module_type == 'shortcut':
+                from_ = int(module['from'])
+                x = outputs[i - 1] + outputs[i + from_]
+
+            elif module_type == 'yolo':
+                break
+            #     anchors = self.module_list[i][0].anchors
+            #     # Get the input dimensions
+            #     inp_dim = int (self.net_info["height"])
+            #     # Get the number of classes
+            #     num_classes = int (module["classes"])
+            #     # Transform
+            #     x = x.data
+            #     x = predict_transform(x, inp_dim, anchors, num_classes, CUDA)
+            #     if not write:
+            #         detections = x
+            #         write = 1
+            #     else:
+            #         detections = torch.cat((detections, x), 1)
+            outputs[i] = x
+
+        return x
 
 
 # from torchvision/models/vgg.py
@@ -164,3 +231,133 @@ def make_layers(cfg, batch_norm=False):
                 layers += [conv2d, nn.ReLU(inplace=True)]
             in_channels = v
     return nn.Sequential(*layers)
+
+
+# from https://github.com/ayooshkathuria/YOLO_v3_tutorial_from_scratch
+def parse_cfg(cfgfile):
+    """Takes a configuration file
+
+    Returns a list of blocks. Each blocks describes a block in the neural
+    network to be built. Block is represented as a dictionary in the list
+    """
+    file = open(cfgfile, 'r')
+    lines = file.read().split('\n')
+    lines = [x for x in lines if len(x) > 0]
+    lines = [x for x in lines if x[0] != '#']
+    lines = [x.rstrip().lstrip() for x in lines]
+    block = {}
+    blocks = []
+
+    for line in lines:
+        if line[0] == '[':
+            if len(block) != 0:
+                blocks.append(block)
+                block = {}
+            block["type"] = line[1:-1].rstrip()
+        else:
+            key, value = line.split('=')
+            block[key.rstrip()] = value.lstrip()
+    blocks.append(block)
+
+    return blocks
+
+
+def create_modules(blocks):
+    net_info = blocks[0]
+    module_list = nn.ModuleList()
+    prev_filters = 3
+    output_filters = []
+
+    for index, x in enumerate(blocks[1:]):
+        module = nn.Sequential()
+        if x['type'] == 'convolutional':
+            activation = x['activation']
+            try:
+                batch_normalize = int(x['batch_normalize'])
+                bias = False
+            except KeyError:
+                batch_normalize = 0
+                bias = True
+
+            filters = int(x['filters'])
+            padding = int(x['pad'])
+            kernel_size = int(x['size'])
+            stride = int(x['stride'])
+
+            if padding:
+                pad = (kernel_size - 1) // 2
+            else:
+                pad = 0
+
+            conv = nn.Conv2d(prev_filters, filters, kernel_size,
+                             stride, pad, bias=bias)
+            module.add_module(f'conv_{index}', conv)
+
+            if batch_normalize:
+                bn = nn.BatchNorm2d(filters)
+                module.add_module(f'batch_norm_{index}', bn)
+
+            if activation == 'leaky':
+                activn = nn.LeakyReLU(0.1, inplace=True)
+                module.add_module(f'leaky_{index}', activn)
+
+        elif x['type'] == 'upsample':
+            stride = int(x['stride'])
+            upsample = nn.Upsample(scale_factor=2, mode="bilinear")
+            module.add_module(f'upsample_{index}', upsample)
+
+        elif x['type'] == 'route':
+            x['layers'] = x['layers'].split(',')
+            start = int(x['layers'][0])
+            try:
+                end = int(x['layers'][1])
+            except IndexError:
+                end = 0
+
+            if start > 0:
+                start = start - index
+            if end > 0:
+                end = end - index
+            route = EmptyLayer()
+            module.add_module(f'route_{index}', route)
+            if end < 0:
+                filters = output_filters[index + start] + \
+                    output_filters[index + end]
+            else:
+                filters = output_filters[index + start]
+
+        elif x['type'] == 'shortcut':
+            shortcut = EmptyLayer()
+            module.add_module(f'shortcut_{index}', shortcut)
+
+        elif x['type'] == 'yolo':
+            # stop here
+            break
+            # mask = x['mask'].split(',')
+            # mask = [int(x) for x in mask]
+
+            # anchors = x['anchors'].split(',')
+            # anchors = [int(a) for a in anchors]
+            # anchors = [(anchors[i], anchors[i+1])
+            #            for i in range(0, len(anchors), 2)]
+            # anchors = [anchors[i] for i in mask]
+
+            # detection = DetectionLayer(anchors)
+            # module.add_module(f'Detection_{index}', detection)
+
+        module_list.append(module)
+        prev_filters = filters
+        output_filters.append(filters)
+
+    return (net_info, module_list)
+
+
+class EmptyLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+# class DetectionLayer(nn.Module):
+#     def __init__(self, anchors):
+#         super().__init__()
+#         self.anchors = anchors
